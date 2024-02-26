@@ -96,27 +96,35 @@ void TableBuilder::Add(const Slice& key, const Slice& value) {
   assert(!r->closed);
   if (!ok()) return;
   if (r->num_entries > 0) {
+    // 当前 key 一定大于上一次插入的 key，这是由 memtable 保证的
     assert(r->options.comparator->Compare(key, Slice(r->last_key)) > 0);
   }
 
+  // 每写完一个 datablock，在 Flush() 中标记 pending_index_entry 为 true
   if (r->pending_index_entry) {
     assert(r->data_block.empty());
     r->options.comparator->FindShortestSeparator(&r->last_key, key);
     std::string handle_encoding;
+    // 将 datablock 的 offset 和 size 写入 handle_encoding
     r->pending_handle.EncodeTo(&handle_encoding);
+    // last_key 是 block 中最大的 key，所以没写完一个 datablock 向 indexblock 写入
+    // max_datablock_key, offset, size 这样一条记录
     r->index_block.Add(r->last_key, Slice(handle_encoding));
     r->pending_index_entry = false;
   }
 
   if (r->filter_block != nullptr) {
+    // 更新 filter
     r->filter_block->AddKey(key);
   }
 
   r->last_key.assign(key.data(), key.size());
   r->num_entries++;
+  // 写 datablock
   r->data_block.Add(key, value);
 
   const size_t estimated_block_size = r->data_block.CurrentSizeEstimate();
+  // datablock 写满，开始写 WritableFile 的 buffer
   if (estimated_block_size >= r->options.block_size) {
     Flush();
   }
@@ -218,13 +226,14 @@ Status TableBuilder::Finish() {
 
   BlockHandle filter_block_handle, metaindex_block_handle, index_block_handle;
 
-  // Write filter block
+  // Write filter block，当前 memtable 已经结束
+  // datablock 已经写完，开始写 filterblock
   if (ok() && r->filter_block != nullptr) {
     WriteRawBlock(r->filter_block->Finish(), kNoCompression,
                   &filter_block_handle);
   }
 
-  // Write metaindex block
+  // Write metaindex block，写 metaindexblock
   if (ok()) {
     BlockBuilder meta_index_block(&r->options);
     if (r->filter_block != nullptr) {
@@ -232,6 +241,7 @@ Status TableBuilder::Finish() {
       std::string key = "filter.";
       key.append(r->options.filter_policy->Name());
       std::string handle_encoding;
+      // store filter block offset and size into handle_encoding
       filter_block_handle.EncodeTo(&handle_encoding);
       meta_index_block.Add(key, handle_encoding);
     }

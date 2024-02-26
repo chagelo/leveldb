@@ -14,6 +14,9 @@
 
 namespace leveldb {
 
+// table_cache: 存储文件句柄 cache
+// iter: memtable 的迭代器
+// meta: sst 关联的文件 metadata
 Status BuildTable(const std::string& dbname, Env* env, const Options& options,
                   TableCache* table_cache, Iterator* iter, FileMetaData* meta) {
   Status s;
@@ -29,17 +32,21 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
     }
 
     TableBuilder* builder = new TableBuilder(options, file);
+    // 存储 minimum key
     meta->smallest.DecodeFrom(iter->key());
     Slice key;
+    // 迭代 memtable 的每条 record 写 sst
     for (; iter->Valid(); iter->Next()) {
       key = iter->key();
       builder->Add(key, iter->value());
     }
     if (!key.empty()) {
+      // 存储 maximum key
       meta->largest.DecodeFrom(key);
     }
 
     // Finish and check for builder errors
+    // 写 filterblock，indexblock，footer 等
     s = builder->Finish();
     if (s.ok()) {
       meta->file_size = builder->FileSize();
