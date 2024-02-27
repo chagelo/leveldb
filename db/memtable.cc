@@ -11,6 +11,7 @@
 
 namespace leveldb {
 
+// 取出一个变长编码 len+key 的 key 部分
 static Slice GetLengthPrefixedSlice(const char* data) {
   uint32_t len;
   const char* p = data;

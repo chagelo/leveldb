@@ -60,6 +60,7 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
       s = Table::Open(options_, file, file_size, &table);
     }
 
+    // 不能打开
     if (!s.ok()) {
       assert(table == nullptr);
       delete file;

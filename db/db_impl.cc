@@ -901,6 +901,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
   assert(versions_->NumLevelFiles(compact->compaction->level()) > 0);
   assert(compact->builder == nullptr);
   assert(compact->outfile == nullptr);
+  // 
   if (snapshots_.empty()) {
     compact->smallest_snapshot = versions_->LastSequence();
   } else {
@@ -924,6 +925,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
       const uint64_t imm_start = env_->NowMicros();
       mutex_.Lock();
       if (imm_ != nullptr) {
+        // 合并 SST 和 imm_ 都需要锁，优先 imm_ 落盘
         CompactMemTable();
         // Wake up MakeRoomForWrite() if necessary.
         background_work_finished_signal_.SignalAll();
@@ -942,6 +944,7 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
     }
 
     // Handle key/value, add to state, etc.
+    // 找出不需要的旧版本的 InternalKey，
     bool drop = false;
     if (!ParseInternalKey(key, &ikey)) {
       // Do not hide error keys
@@ -953,11 +956,13 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
           user_comparator()->Compare(ikey.user_key, Slice(current_user_key)) !=
               0) {
         // First occurrence of this user key
+        // 第一个 user_key，更新 current_user_key
         current_user_key.assign(ikey.user_key.data(), ikey.user_key.size());
         has_current_user_key = true;
         last_sequence_for_key = kMaxSequenceNumber;
       }
 
+      // 当前 key 不是第一个，那么当前 InternalKey 的 seqNum 一定更旧，所以可以删除
       if (last_sequence_for_key <= compact->smallest_snapshot) {
         // Hidden by an newer entry for same user key
         drop = true;  // (A)
@@ -986,8 +991,10 @@ Status DBImpl::DoCompactionWork(CompactionState* compact) {
         (int)last_sequence_for_key, (int)compact->smallest_snapshot);
 #endif
 
+    // drop = true 直接跳出
     if (!drop) {
       // Open output file if necessary
+      // 新建一个 builder 用于输出
       if (compact->builder == nullptr) {
         status = OpenCompactionOutputFile(compact);
         if (!status.ok()) {
@@ -1217,7 +1224,10 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
   uint64_t last_sequence = versions_->LastSequence();
   Writer* last_writer = &w;
   if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
+    // 当前进程持有锁，所以可以对队列里的后面的 Writer 进行合并
+    // last_writer 指向可以合并的 Writer 中最后一个
     WriteBatch* write_batch = BuildBatchGroup(&last_writer);
+    // 更新合并后 WriteBatch 的 seqNum
     WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
     last_sequence += WriteBatchInternal::Count(write_batch);
 
@@ -1225,6 +1235,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     // during this phase since &w is currently responsible for logging
     // and protects against concurrent loggers and concurrent writes
     // into mem_.
+    // &w 负责 wal 以及避免并发写 mem_，对 Writer_ 队列的读写需要互斥
     {
       mutex_.Unlock();
       status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
@@ -1243,6 +1254,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
         // The state of the log file is indeterminate: the log record we
         // just added may or may not show up when the DB is re-opened.
         // So we force the DB into a mode where all future writes fail.
+        // WAL 落盘错误
         RecordBackgroundError(status);
       }
     }
@@ -1251,6 +1263,9 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     versions_->SetLastSequence(last_sequence);
   }
 
+  // 将之前合并的 Writers_ 从队列中移除
+  // 对于当前 Writer，从队列直接移除就行了，然后当前线程已经写 wal 和 memtable 结束了
+  // 对于后面被合并的从队列中移除并将 done 设置为 true 表明已经写完毕，之后相应线程直接返回
   while (true) {
     Writer* ready = writers_.front();
     writers_.pop_front();

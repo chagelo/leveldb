@@ -66,6 +66,8 @@ Status BuildTable(const std::string& dbname, Env* env, const Options& options,
 
     if (s.ok()) {
       // Verify that the table is usable
+      // 1. 检查写入是否 ok
+      // 2. 将 sst 加入 tablecache
       Iterator* it = table_cache->NewIterator(ReadOptions(), meta->number,
                                               meta->file_size);
       s = it->status();
