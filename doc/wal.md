@@ -2,7 +2,7 @@
 
 电脑断电，宕机，服务挂掉
 
-文件格式为 `000012.log`，6 位数字加 log 后缀
+文件格式为 `000012.ldb`，6 位数字加 log 后缀
 
 LevelDB 实现了一个 Writer 类来执行预写日志，这个 Writer 可以理解为一个日志文件对象
 
@@ -22,6 +22,4 @@ fragment 格式
 
 ![](./img/walrecord.png)
 
-`Status Writer::AddRecord(const Slice &slice)` 就是对 slice 数据进行分片然后调用 `EmitPhysicalRecord`，后者就是写缓冲区，当缓冲区满进行 Flush
-
-需要注意 levelDB 每写完一个 key-value 就会 sync 一下到磁盘
+`Status Writer::AddRecord(const Slice &slice)` 就是对 slice 数据进行分片然后调用 `EmitPhysicalRecord`，后者就是写缓冲区，当缓冲区满进行 Flush，如果用户提供了 options，在配置 leveldb 时会传递参数，将 WriteOptions 的 sync 字段设置为 true，意味着将用户态 buffer 同步到内核态 buffer（否则是写满才同步），这样的话 DB 的 write 就和系统调用 write 没有什么区别了

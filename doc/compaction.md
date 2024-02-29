@@ -11,13 +11,18 @@ LevelDB中LSM-Tree的Compaction操作分为两类，分别是Minor Compaction与
 - Seek Compaction：根据SSTable的seek miss触发的Major Compaction。
 - Manual Compaction：LevelDB使用者通过接口void CompactRange(const Slice* begin, const Slice* end)手动触发。
 
+## Compaction 优先级
+
+Minor Compaction > Manual Compaction > Size Compaction > Seek Compaction
+
 # 后台线程
 
 后台线程是不存在并发的，同一时刻只会有一个后台线程在执行。后台线程和Write线程存在并发竞争，所以在关键区域要使用成员变量mutex_加锁。LevelDB 只使用了 1 个后台线程，因此 Compaction 仍是串行而不是并行的
 
-## Compaction 优先级
+调用顺序为
+MaybeScheduleCompaction->Schedule
 
-Minor Compaction > Manual Compaction > Size Compaction > Seek Compaction
+在 Schedule 内部主线程创建子线程然后子线程去执行队列队列中的任务，主线程将任务入队然后唤醒后台线程
 
 # LevelDB SST 分层
 

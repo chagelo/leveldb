@@ -185,16 +185,21 @@ Status DBImpl::NewDB() {
   new_db.SetNextFile(2);
   new_db.SetLastSequence(0);
 
+  // manifest path
   const std::string manifest = DescriptorFileName(dbname_, 1);
   WritableFile* file;
+  // open manifest file
   Status s = env_->NewWritableFile(manifest, &file);
   if (!s.ok()) {
     return s;
   }
-  {
+  { 
+    // log::Writer 就是向 manifest 中写 record 的
+    // 写 manifest 和 写 wal 方式一样
     log::Writer log(file);
     std::string record;
     new_db.EncodeTo(&record);
+    // 刚创建应该写一个空的 Version
     s = log.AddRecord(record);
     if (s.ok()) {
       s = file->Sync();
@@ -203,11 +208,13 @@ Status DBImpl::NewDB() {
       s = file->Close();
     }
   }
+  // 关闭
   delete file;
   if (s.ok()) {
     // Make "CURRENT" file that points to the new manifest file.
     s = SetCurrentFile(env_, dbname_, 1);
   } else {
+    // 写失败或者发生错误，移除
     env_->RemoveFile(manifest);
   }
   return s;
@@ -669,10 +676,14 @@ void DBImpl::MaybeScheduleCompaction() {
     // Already got an error; no more changes
   } else if (imm_ == nullptr && manual_compaction_ == nullptr &&
              !versions_->NeedsCompaction()) {
+    // imm_ is not null means Minor Compaction
+    // manual_compaction_ is not null means Manual Compaction
+    // NeedsCompaction check whether needs size compaction and seek compaction or not 
     // No work to be done
   } else {
     background_compaction_scheduled_ = true;
     env_->Schedule(&DBImpl::BGWork, this);
+    // 创建一个线程，让线程去执行队列里的任务，主线程创建完毕后将任务入队列
   }
 }
 
@@ -1373,6 +1384,7 @@ Status DBImpl::MakeRoomForWrite(bool force) {
       Log(options_.info_log, "Too many L0 files; waiting...\n");
       background_work_finished_signal_.Wait();
     } else {
+      // have enough room for convert memtable to immemtable
       // Attempt to switch to a new memtable and trigger compaction of old
       assert(versions_->PrevLogNumber() == 0);
       uint64_t new_log_number = versions_->NewFileNumber();
