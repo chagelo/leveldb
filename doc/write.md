@@ -9,78 +9,18 @@
 #  DBImpl::Write
 
 ```cpp
-Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
-  Writer w(&mutex_);
-  w.batch = updates;
-  w.sync = options.sync;
-  w.done = false;
-
-  MutexLock l(&mutex_);
-  writers_.push_back(&w);
-  while (!w.done && &w != writers_.front()) {
-    w.cv.Wait();
-  }
-  if (w.done) {
-    return w.status;
-  }
-
-  // May temporarily unlock and wait.
-  Status status = MakeRoomForWrite(updates == nullptr);
-  uint64_t last_sequence = versions_->LastSequence();
-  Writer* last_writer = &w;
-  if (status.ok() && updates != nullptr) {  // nullptr batch is for compactions
-    WriteBatch* write_batch = BuildBatchGroup(&last_writer);
-    WriteBatchInternal::SetSequence(write_batch, last_sequence + 1);
-    last_sequence += WriteBatchInternal::Count(write_batch);
-
-    // Add to log and apply to memtable.  We can release the lock
-    // during this phase since &w is currently responsible for logging
-    // and protects against concurrent loggers and concurrent writes
-    // into mem_.
-    {
-      mutex_.Unlock();
-      status = log_->AddRecord(WriteBatchInternal::Contents(write_batch));
-      bool sync_error = false;
-      if (status.ok() && options.sync) {
-        status = logfile_->Sync();
-        if (!status.ok()) {
-          sync_error = true;
-        }
-      }
-      if (status.ok()) {
-        status = WriteBatchInternal::InsertInto(write_batch, mem_);
-      }
-      mutex_.Lock();
-      if (sync_error) {
-        // The state of the log file is indeterminate: the log record we
-        // just added may or may not show up when the DB is re-opened.
-        // So we force the DB into a mode where all future writes fail.
-        RecordBackgroundError(status);
-      }
-    }
-    if (write_batch == tmp_batch_) tmp_batch_->Clear();
-
-    versions_->SetLastSequence(last_sequence);
-  }
-
-  while (true) {
-    Writer* ready = writers_.front();
-    writers_.pop_front();
-    if (ready != &w) {
-      ready->status = status;
-      ready->done = true;
-      ready->cv.Signal();
-    }
-    if (ready == last_writer) break;
-  }
-
-  // Notify new head of write queue
-  if (!writers_.empty()) {
-    writers_.front()->cv.Signal();
-  }
-
-  return status;
-}
+DBImpl::Put
+    DB::Put
+        batch.Put
+        DBImpl::Write
+            DBImpl::MakeRoomForWrite(updates == nullptr)
+                mem_ = new MemTable
+                s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile);
+                MaybeScheduleCompaction();
+            DBImpl::BuildBatchGroup(&last_writer);
+            log_->AddRecord(WriteBatchInternal::Contents(write_batch));
+            logfile_->Sync();
+            WriteBatchInternal::InsertInto(write_batch, mem_);
 ```
 
 1. 设置当前 Writer 
@@ -93,7 +33,27 @@ levelDB 还对 WriteBatch 进行了合并，如果发现当前 Writer 是队首�
 - 如果合并后的 size 大于 max_size（1MB）就推出
 
 
+1. DBImpl::MakeRoomForWrite，这个函数是用来确保，当用户的 batch 写时，内存里面还有空间，mem、imm，里面很多细节
+  - 如果有需要写的内容，那么  allow_delay = true，并且如果此时 L0 files 数量触发慢写阈值
+    - 释放锁
+    - 睡眠 1s
+    - 睡眠结束，allow_delay，当前写不能再次推迟
+    - 上锁
+  - 如果有需要写的内容，并且 mem 还有容量，否则下一步
+  - imm 不为空，即 imm 正在写磁盘，mem 没空间了，那么等待后台 imm 写完成，否则下一步
+  - mem 没空间，imm 为空，且 L0 文件太多触发停止写阈值，等待，否则下一步
+  - mem 没空间，imm 为空，此时可以把 mem 转换成 imm，并在磁盘创建文件，为 imm 写磁盘做准备
+2. s = env_->NewWritableFile(LogFileName(dbname_, new_log_number), &lfile); 这个函数会为当前新的 mem 创建一个 000001.log wal 文件，注意此时 imm 是空的，所以不用关注 imm 对应的 wal
+3. BuildBatchGroup，当前有一个 writers_ 是个 Writer task 写队列，这个函数会尽可能从对队首（当前处理的是队首 Writer task）往后合并 Writer
+4. log_->AddRecord 会把当前和并之后的 Writer 里的 writer batch 里的数据拿出来写到 mem 对应的 wal 中，这个函数内部调用了 write 系统调用，如果开启 sync 标志，此时还会调用 fsync。wal 中会写一些校验信息，所以即使挂掉，也还 ok
+5.  WriteBatchInternal::InsertInto(write_batch, mem_)，当上一步完成之后，会将数据写到 mem 中
+  - 写 mem 可能出现冲突吗，可能出现不一致，但不会出现读写冲突，这个原因是 skiplist 中节点都是原子的单向指针；不会出现写写冲突，因为只有队首元素才能写 mem，写完才会调用 pop_back，
+  - 在写 mem 和 wal 的过程中释放锁，使得其他线程可以向 queue 中 append writer task，或者做一些 compactin 的操作；读 mem 和 imm 和 sst files 不会上锁
+6. 在这之后就是删除完成的 writer task，唤醒那些被阻塞的 task
+
+
+
+
 # ref
 
 1. [LevelDB源码解析(14) 写操作之Write主流程](https://www.huliujia.com/blog/24af576aa3/)
-2. 

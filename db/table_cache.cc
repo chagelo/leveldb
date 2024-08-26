@@ -34,6 +34,7 @@ TableCache::TableCache(const std::string& dbname, const Options& options,
     : env_(options.env),
       dbname_(dbname),
       options_(options),
+      // SharedLRUCache, each one is a LRU
       cache_(NewLRUCache(entries)) {}
 
 TableCache::~TableCache() { delete cache_; }
@@ -44,9 +45,12 @@ Status TableCache::FindTable(uint64_t file_number, uint64_t file_size,
   char buf[sizeof(file_number)];
   EncodeFixed64(buf, file_number);
   Slice key(buf, sizeof(buf));
+  // if there is a mapping
   *handle = cache_->Lookup(key);
+  // Not in TableCache
   if (*handle == nullptr) {
     std::string fname = TableFileName(dbname_, file_number);
+    // Read interface
     RandomAccessFile* file = nullptr;
     Table* table = nullptr;
     s = env_->NewRandomAccessFile(fname, &file);
@@ -98,6 +102,7 @@ Iterator* TableCache::NewIterator(const ReadOptions& options,
   return result;
 }
 
+// Search the TableCache
 Status TableCache::Get(const ReadOptions& options, uint64_t file_number,
                        uint64_t file_size, const Slice& k, void* arg,
                        void (*handle_result)(void*, const Slice&,

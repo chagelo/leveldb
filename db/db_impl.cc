@@ -104,8 +104,11 @@ Options SanitizeOptions(const std::string& dbname,
   ClipToRange(&result.block_size, 1 << 10, 4 << 20);
   if (result.info_log == nullptr) {
     // Open a log file in the same directory as the db
+    // create root directory
     src.env->CreateDir(dbname);  // In case it does not exist
+    // rename file LOG->LOG.old
     src.env->RenameFile(InfoLogFileName(dbname), OldInfoLogFileName(dbname));
+    // create LOG file
     Status s = src.env->NewLogger(InfoLogFileName(dbname), &result.info_log);
     if (!s.ok()) {
       // No place suitable for logging
@@ -127,11 +130,14 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
     : env_(raw_options.env),
       internal_comparator_(raw_options.comparator),
       internal_filter_policy_(raw_options.filter_policy),
+      // convert ./LOG to ./LOG.old if exists
+      // create ./LOG, create BlockCache if no exists
       options_(SanitizeOptions(dbname, &internal_comparator_,
                                &internal_filter_policy_, raw_options)),
       owns_info_log_(options_.info_log != raw_options.info_log),
       owns_cache_(options_.block_cache != raw_options.block_cache),
       dbname_(dbname),
+      // create TableCache
       table_cache_(new TableCache(dbname_, options_, TableCacheSize(options_))),
       db_lock_(nullptr),
       shutting_down_(false),
@@ -139,12 +145,16 @@ DBImpl::DBImpl(const Options& raw_options, const std::string& dbname)
       mem_(nullptr),
       imm_(nullptr),
       has_imm_(false),
+
       logfile_(nullptr),
       logfile_number_(0),
       log_(nullptr),
+
       seed_(0),
       tmp_batch_(new WriteBatch),
+      // Has a background compaction been scheduled or is running?
       background_compaction_scheduled_(false),
+      // Information for a manual compaction
       manual_compaction_(nullptr),
       versions_(new VersionSet(dbname_, &options_, table_cache_,
                                &internal_comparator_)) {}
@@ -734,6 +744,7 @@ void DBImpl::BackgroundCompaction() {
         (m->end ? m->end->DebugString().c_str() : "(end)"),
         (m->done ? "(end)" : manual_end.DebugString().c_str()));
   } else {
+    // pick a level to compaction
     c = versions_->PickCompaction();
   }
 
@@ -1153,6 +1164,7 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
   Version::GetStats stats;
 
   // Unlock while reading from files and memtables
+  // Read mem->imm->files
   {
     mutex_.Unlock();
     // First look in the memtable, then in the immutable memtable (if any).
@@ -1168,6 +1180,8 @@ Status DBImpl::Get(const ReadOptions& options, const Slice& key,
     mutex_.Lock();
   }
 
+  // One way trigerring compaction is lookup in the sst file,
+  // but miss too many times
   if (have_stat_update && current->UpdateStats(stats)) {
     MaybeScheduleCompaction();
   }
@@ -1216,6 +1230,8 @@ Status DBImpl::Delete(const WriteOptions& options, const Slice& key) {
 }
 
 Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
+  // Easy to understand, construct a Writer task, store WriteBatch data into 
+  // this Write task, and put it into writers_, a Write task queue
   Writer w(&mutex_);
   w.batch = updates;
   w.sync = options.sync;
@@ -1223,13 +1239,20 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
 
   MutexLock l(&mutex_);
   writers_.push_back(&w);
+  // Task not finish and the current task is not the front of the queue
+  // just wait until it's notified
   while (!w.done && &w != writers_.front()) {
     w.cv.Wait();
   }
+  // current task finished or w is the front one
+
+  // current task finished
   if (w.done) {
     return w.status;
   }
 
+  // w is in front of queue
+  
   // May temporarily unlock and wait.
   Status status = MakeRoomForWrite(updates == nullptr);
   uint64_t last_sequence = versions_->LastSequence();
@@ -1281,6 +1304,7 @@ Status DBImpl::Write(const WriteOptions& options, WriteBatch* updates) {
     Writer* ready = writers_.front();
     writers_.pop_front();
     if (ready != &w) {
+      // writer tasks combined
       ready->status = status;
       ready->done = true;
       ready->cv.Signal();

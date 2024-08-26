@@ -15,14 +15,46 @@ LevelDB中LSM-Tree的Compaction操作分为两类，分别是Minor Compaction与
 
 Minor Compaction > Manual Compaction > Size Compaction > Seek Compaction
 
-# 后台线程
+# 调用流程
+
+**所有的 compaction 追踪溯源都来自于 put 和 get 的调用
+
+```cpp
+DBImpl::MaybeScheduleCompaction
+    env_(PosixEnv or WindowsEnv)->Schedule(&DBImpl::BGWork, this)
+        DBImpl::BGWork(void* db)
+            DBImpl::BackgroundCall
+                DBImpl::BackgroundCompaction
+                    DBImpl::CompactMemTable（imm compaction）
+                        versions_->LogAndApply(&edit, &mutex_)
+                        WriteLevel0Table(imm_, &edit, base(Version*));
+                            BuildTable(dbname_, env_, options_, table_cache_, iter(mem Iterator), &meta)
+                            base(Version*)->PickLevelForMemTableOutput(min_user_key, max_user_key)
+                    versions_(VersionSet)->CompactRange（Manual compaction）
+                    versions_(VersionSet)->PickCompaction
+                        VersionSet::SetupOtherInputs(Compaction* c)
+                    DBImpl::DoCompactionWork(compact(CompactionState*))
+                    DBImpl::CleanupCompaction(compact)
+                    DBImpl::RemoveObsoleteFiles()
+            DBImpl::MaybeScheduleCompaction（递归）
+```
+
+
+1. env_(PosixEnv or WindowsEnv)->Schedule，Schedule 会把函数入口和参数放入一个队列，然后有一个线程不断调用这个队列里的函数，队列空就阻塞
+2. DBImpl::CompactMemTable
+    1. versions_->LogAndApply，向 MANIFEST-X 内写入 Version，创建 tmp 文件，向 tmp 文件写入当前 MANIFEST-X 的文件名，然后重命名为 CURRENT 
+    2. WriteLevel0Table
+        1. BuildTable，写文件，写 datablock 写 metadata index footer，宕机也没事因为有 MANIFEST-X 和 LOG.old
+        2. PickLevelForMemTableOutput，把新创建的 memtable 往合适的 level 放，尽可能不太小也不太大，太大文件大小都很大，加入一个小文件，如果由于这个小文件导致的 compaction 那么开销很大；最大就放在 2 层（0 层开始）
+3. CompactRange 用户发起的 compaction
+4. PickCompaction，选择某个层进行 compaction
+    1. size compaction，移动一个 sst 到下一层；如果当前文件的 largeest key 比上一次 compaction 的文件的 largest key 大，那么就 compaction 它了，如果没有更大的，那么就 compaction 第一个；这样做的目的应该是使得 key 更加分散
+    2. seek compaction
+5. VersionSet::SetupOtherInputs，比如 level i 选了一个文件，在 i + 1 层确定哪些文件和这个有 overlap
+6. 如果能够通过移动 compaction，那就移动，改一些 Version 信息然后改一下 MANIFEST 就行
+7. DBImpl::DoCompactionWork，
 
 后台线程是不存在并发的，同一时刻只会有一个后台线程在执行。后台线程和Write线程存在并发竞争，所以在关键区域要使用成员变量mutex_加锁。LevelDB 只使用了 1 个后台线程，因此 Compaction 仍是串行而不是并行的
-
-调用顺序为
-MaybeScheduleCompaction->Schedule
-
-在 Schedule 内部主线程创建子线程然后子线程去执行队列队列中的任务，主线程将任务入队然后唤醒后台线程
 
 # LevelDB SST 分层
 
@@ -37,93 +69,10 @@ L0 层是通过文件数量来限制的，涉及到几个不同的限制程度�
 
 # DBImpl::BackgroundCompaction
 
-```cpp
-void DBImpl::BackgroundCompaction() {
-  mutex_.AssertHeld();
-
-  if (imm_ != nullptr) {
-    CompactMemTable();
-    return;
-  }
-
-  Compaction* c;
-  bool is_manual = (manual_compaction_ != nullptr);
-  InternalKey manual_end;
-  if (is_manual) {
-    ManualCompaction* m = manual_compaction_;
-    c = versions_->CompactRange(m->level, m->begin, m->end);
-    m->done = (c == nullptr);
-    if (c != nullptr) {
-      manual_end = c->input(0, c->num_input_files(0) - 1)->largest;
-    }
-    Log(options_.info_log,
-        "Manual compaction at level-%d from %s .. %s; will stop at %s\n",
-        m->level, (m->begin ? m->begin->DebugString().c_str() : "(begin)"),
-        (m->end ? m->end->DebugString().c_str() : "(end)"),
-        (m->done ? "(end)" : manual_end.DebugString().c_str()));
-  } else {
-    c = versions_->PickCompaction();
-  }
-
-  Status status;
-  if (c == nullptr) {
-    // Nothing to do
-  } else if (!is_manual && c->IsTrivialMove()) {
-    // Move file to next level
-    assert(c->num_input_files(0) == 1);
-    FileMetaData* f = c->input(0, 0);
-    c->edit()->RemoveFile(c->level(), f->number);
-    c->edit()->AddFile(c->level() + 1, f->number, f->file_size, f->smallest,
-                       f->largest);
-    status = versions_->LogAndApply(c->edit(), &mutex_);
-    if (!status.ok()) {
-      RecordBackgroundError(status);
-    }
-    VersionSet::LevelSummaryStorage tmp;
-    Log(options_.info_log, "Moved #%lld to level-%d %lld bytes %s: %s\n",
-        static_cast<unsigned long long>(f->number), c->level() + 1,
-        static_cast<unsigned long long>(f->file_size),
-        status.ToString().c_str(), versions_->LevelSummary(&tmp));
-  } else {
-    CompactionState* compact = new CompactionState(c);
-    status = DoCompactionWork(compact);
-    if (!status.ok()) {
-      RecordBackgroundError(status);
-    }
-    CleanupCompaction(compact);
-    c->ReleaseInputs();
-    RemoveObsoleteFiles();
-  }
-  delete c;
-
-  if (status.ok()) {
-    // Done
-  } else if (shutting_down_.load(std::memory_order_acquire)) {
-    // Ignore compaction errors found during shutting down
-  } else {
-    Log(options_.info_log, "Compaction error: %s", status.ToString().c_str());
-  }
-
-  if (is_manual) {
-    ManualCompaction* m = manual_compaction_;
-    if (!status.ok()) {
-      m->done = true;
-    }
-    if (!m->done) {
-      // We only compacted part of the requested range.  Update *m
-      // to the range that is left to be compacted.
-      m->tmp_storage = manual_end;
-      m->begin = &m->tmp_storage;
-    }
-    manual_compaction_ = nullptr;
-  }
-}
-```
-
 1. 如果 imm_ 不为空，则先将 imm_ 写 SST 的 l0-l2 层，然后返回
 2. 看是否能够通过移动来进行合并（什么时候能够通过移动进行合并，当前层 level i 文件只有一个，下一层 level i+1 层文件 0 个，且这个文件和 level i+2 层重叠部分小于给定阈值）
-3. 如果可以直接移动，并且更改 Version 的文件 metadata
-4. 正常合并，调用 `DoCompactionWork`
+    - 如果可以直接移动，并且更改 Version 的文件 metadata
+3. 正常合并，调用 `DoCompactionWork`
 
 ### 选择 level i 层 需要合并的文件
 

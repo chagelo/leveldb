@@ -15,6 +15,8 @@ namespace leveldb {
 
 class VersionSet;
 
+// Contains file number, smallest, largest internalKey of this file,
+// seeks allowed until compaction, file size
 struct FileMetaData {
   FileMetaData() : refs(0), allowed_seeks(1 << 30), file_size(0) {}
 

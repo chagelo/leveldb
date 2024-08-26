@@ -47,5 +47,5 @@ memtable 查找时通过一个 LookupKey 进行查找 (user_key | batch_seqnum |
 
 LevelDB每次写入key-value都是写入到内存中的Memtable中的，但是Memtable的空间不是无限的，Memtable写满（默认4MB）后，就需要调用MakeRoomForWrite把Memtable转存为Immutable Memtable，并创建新的Memtable来存储写入数据。必要时还会调度后台线程把Immutable Memtable落盘，以及合并SST文件。
 
-1. 如果允许 delay，并且 l0 层文件数量超过慢写阈值（默认 8 个文件），就等待 1ms，然后把 allow_delay 设置为 false，所以慢写延迟操作最多执行一次，避免上面的 Writer 主流程被阻塞太久
+1. 如果允许 delay，并且 l0 层文件数量超过慢写阈值（默认 8 个文件），就等待 1ms，然后把 allow_delay 设置为 false，所以慢写延迟操作最多执行一次，避免上面的 Writer 主流程被阻塞太久；但之后 allow_delay 就变成了 true，不允许延迟第二次。
 2. 
